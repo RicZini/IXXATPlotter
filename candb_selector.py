@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 import os
 import logging
 
-# Configure standard logging for professional debugging
+# Configure standard logging for clear, professional console output
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -12,28 +12,27 @@ logging.basicConfig(
 
 class CanDbSelectorApp:
     """
-    Graphical User Interface application to parse and display 
+    Python Desktop Application to parse and selectively load 
     NI-XNET CAN Database XML files (FIBEX format).
+    Implements Lazy Loading to ensure UI responsiveness with large datasets.
     """
 
     def __init__(self, root: tk.Tk) -> None:
-        """Initialize the main application window and internal data structures."""
+        """Initialize the main application window and application state."""
         logging.debug("Initializing CanDbSelectorApp...")
         self.root = root
         self.root.title("NI-XNET CAN Database Selector")
         self.root.geometry("600x500")
         
-        # Data storage dictionary to hold frames and their corresponding signals
-        # Format: { "Frame_Name": ["Signal1", "Signal2", ...] }
+        # In-memory data store for parsed XML content
+        # Structure: { "Frame_Name": ["Signal1", "Signal2", ...] }
         self.can_data: dict[str, list[str]] = {} 
         
         self.setup_ui()
-        logging.debug("GUI setup complete.")
+        logging.debug("GUI initialized and ready.")
 
     def setup_ui(self) -> None:
-        """Build and arrange User Interface components."""
-        logging.debug("Building UI components...")
-        
+        """Construct the Tkinter widget layout."""
         # --- Top Frame: File Selection ---
         top_frame = tk.Frame(self.root)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
@@ -44,7 +43,7 @@ class CanDbSelectorApp:
         self.lbl_file = tk.Label(top_frame, text="No file selected", fg="gray")
         self.lbl_file.pack(side=tk.LEFT, padx=10)
         
-        # --- Middle Frame: Treeview for Packages and Signals ---
+        # --- Middle Frame: Treeview for CAN Hierarchy ---
         mid_frame = tk.Frame(self.root)
         mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
         
@@ -56,9 +55,11 @@ class CanDbSelectorApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.configure(yscrollcommand=scrollbar.set)
         
+        # Bind events for Lazy Loading and selection tracking
+        self.tree.bind("<<TreeviewOpen>>", self.on_frame_expand)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         
-        # --- Bottom Frame: Next Action Integration ---
+        # --- Bottom Frame: Next Action ---
         bot_frame = tk.Frame(self.root)
         bot_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
         
@@ -66,18 +67,18 @@ class CanDbSelectorApp:
         self.btn_next.pack(side=tk.RIGHT)
 
     def load_file(self) -> None:
-        """Open a file dialog to select the XML database."""
-        logging.debug("Triggered file selection dialog.")
+        """Callback to open file dialog and initiate XML parsing."""
+        logging.debug("File selection dialog opened by user.")
         filepath = filedialog.askopenfilename(
             title="Select NI-XNET XML Database",
             filetypes=(("XML files", "*.xml"), ("All files", "*.*"))
         )
         
         if not filepath:
-            logging.debug("File selection cancelled by user.")
+            logging.debug("File selection cancelled.")
             return
             
-        logging.info(f"File selected: {filepath}")
+        logging.info(f"Selected file: {filepath}")
         self.lbl_file.config(text=os.path.basename(filepath), fg="black")
         
         self.btn_next.config(state=tk.NORMAL)
@@ -85,98 +86,166 @@ class CanDbSelectorApp:
 
     def parse_xml(self, filepath: str) -> None:
         """
-        Parse the selected XML file, strip namespaces, and extract
-        FRAME and SIGNAL elements into the internal dictionary.
+        Advanced FIBEX/AUTOSAR XML parser.
+        Resolves cross-references between FRAME -> PDU -> SIGNAL using IDs.
         """
-        logging.info(f"Starting XML parsing engine for: {filepath}")
+        logging.info("Starting relational XML parser (FIBEX standard)...")
         self.can_data.clear()
         
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
-            logging.debug(f"XML loaded into memory. Root Tag: {root.tag}")
             
-            # Strip namespaces for robust parsing
+            # Normalize tags by stripping XML namespaces to simplify searching
             for elem in root.iter():
                 if '}' in elem.tag:
                     elem.tag = elem.tag.split('}', 1)[1]
             
-            logging.debug("Stripped XML namespaces for standardized processing.")
+            logging.debug("Namespaces stripped. Building relational memory maps...")
+
+            # --- STEP 1: Map all Signals (ID -> Name) ---
+            signal_map = {}
+            for sig in root.findall('.//SIGNAL'):
+                sig_id = sig.get('ID')
+                name_elem = sig.find('.//SHORT-NAME')
+                if name_elem is None:
+                    name_elem = sig.find('NAME')
+                    
+                if sig_id and name_elem is not None and name_elem.text:
+                    signal_map[sig_id] = name_elem.text.strip()
+                    
+            logging.debug(f"Mapped {len(signal_map)} distinct Signals.")
+
+            # --- STEP 2: Map all PDUs (ID -> List of Signal Names) ---
+            pdu_map = {}
+            pdu_elements = root.findall('.//PDU')
             
+            # Pass 2A: Extract direct signals within each PDU
+            for pdu in pdu_elements:
+                pdu_id = pdu.get('ID')
+                signals = []
+                
+                # Find all signal references inside this PDU
+                for sig_ref in pdu.findall('.//SIGNAL-REF'):
+                    ref_id = sig_ref.get('ID-REF')
+                    if ref_id in signal_map:
+                        signals.append(signal_map[ref_id])
+                
+                if pdu_id:
+                    pdu_map[pdu_id] = signals
+
+            # Pass 2B: Resolve nested PDUs (Multiplexers)
+            # Some PDUs contain references to other PDUs (e.g. dpdu)
+            for pdu in pdu_elements:
+                pdu_id = pdu.get('ID')
+                for pdu_ref in pdu.findall('.//PDU-REF'):
+                    ref_id = pdu_ref.get('ID-REF')
+                    # If this PDU references another PDU, inherit its signals
+                    if ref_id in pdu_map and pdu_id in pdu_map:
+                        pdu_map[pdu_id].extend(pdu_map[ref_id])
+
+            logging.debug(f"Mapped {len(pdu_map)} PDUs and resolved multiplexed references.")
+
+            # --- STEP 3: Map Frames and link them to PDUs ---
             frames = root.findall('.//FRAME')
-            logging.info(f"Parsing detected {len(frames)} FRAME elements.")
+            logging.info(f"Successfully extracted {len(frames)} FRAME definitions.")
             
             for frame in frames:
                 frame_name_elem = frame.find('.//SHORT-NAME')
                 if frame_name_elem is None:
                     frame_name_elem = frame.find('NAME')
                     
-                frame_name = frame_name_elem.text if frame_name_elem is not None else "Unknown_Frame"
-                logging.debug(f"Extracting data for Frame: {frame_name}")
+                frame_name = frame_name_elem.text.strip() if frame_name_elem is not None else "Unknown_Frame"
+                frame_signals = []
                 
-                self.can_data[frame_name] = []
+                # A Frame references PDUs. We fetch the signals mapped to those PDUs.
+                for pdu_ref in frame.findall('.//PDU-REF'):
+                    ref_id = pdu_ref.get('ID-REF')
+                    if ref_id in pdu_map:
+                        frame_signals.extend(pdu_map[ref_id])
                 
-                signals = frame.findall('.//SIGNAL')
-                if not signals:
-                    signals = frame.findall('.//SIGNAL-INSTANCE')
-                    
-                logging.debug(f"Found {len(signals)} Signals inside Frame '{frame_name}'.")
+                # Remove any duplicates (caused by complex multiplexing) and assign to main dictionary
+                # dict.fromkeys() is the fastest, order-preserving way to remove duplicates in Python
+                self.can_data[frame_name] = list(dict.fromkeys(frame_signals))
                 
-                for sig in signals:
-                    sig_name_elem = sig.find('.//SHORT-NAME')
-                    if sig_name_elem is None:
-                        sig_name_elem = sig.find('NAME')
-                        
-                    sig_name = sig_name_elem.text if sig_name_elem is not None else "Unknown_Signal"
-                    self.can_data[frame_name].append(sig_name)
-                    logging.debug(f"  --> Mapped Signal: {sig_name}")
+                logging.debug(f"  --> Frame [{frame_name}] mapped with {len(self.can_data[frame_name])} signals.")
             
             if not self.can_data:
-                logging.warning("No frames were mapped. The XML schema might not match expected FIBEX format.")
-                self.can_data["[Error] No frames found"] = ["Check XML tag structure"]
+                logging.warning("No frames found. Verify the file structure.")
+                self.can_data["[Error] Setup failed"] = ["Invalid schema"]
                 
-            self.populate_tree()
+            # Initialize User Interface components
+            self.populate_tree_base()
             
         except ET.ParseError as e:
-            logging.error(f"XML Parse Error: {e}")
+            logging.error(f"XML parsing failed: {e}")
         except Exception as e:
-            logging.error(f"Unexpected error during XML parsing: {e}", exc_info=True)
+            logging.error(f"Unexpected error during parsing: {e}", exc_info=True)
 
-    def populate_tree(self) -> None:
-        """Clear existing UI nodes and populate the Treeview with parsed data."""
-        logging.debug("Clearing existing items in the Treeview...")
+    def populate_tree_base(self) -> None:
+        """
+        Populate only the root nodes (Frames) in the Treeview.
+        Injects a dummy node to enable the expand arrow for lazy loading.
+        """
+        logging.debug("Clearing previous Treeview contents...")
         for item in self.tree.get_children():
             self.tree.delete(item)
             
-        logging.debug("Populating Treeview with extracted CAN database information...")
-        for frame, signals in self.can_data.items():
-            frame_id = self.tree.insert("", tk.END, text=f"Frame: {frame}", open=False)
-            logging.debug(f"Added GUI Node for Frame: {frame}")
+        logging.debug("Populating root Frame nodes (Lazy Loading strategy)...")
+        for frame in self.can_data.keys():
+            # Store the frame key in the 'values' tuple to retrieve it easily later
+            frame_id = self.tree.insert("", tk.END, text=f"Frame: {frame}", values=(frame,), open=False)
             
-            for sig in signals:
-                self.tree.insert(frame_id, tk.END, text=f"Signal: {sig}")
-                logging.debug(f"Added GUI Sub-node for Signal: {sig} (Parent: {frame})")
+            # Insert a dummy child to force tkinter to draw the expand [+] icon
+            self.tree.insert(frame_id, tk.END, text="__dummy__")
                 
-        logging.info("Treeview population complete.")
+        logging.info("Treeview base layer populated.")
+
+    def on_frame_expand(self, event: tk.Event) -> None:
+        """
+        Callback triggered when a user expands a node.
+        Checks for the dummy node, removes it, and loads actual Signals on the fly.
+        """
+        # Get the ID of the node being expanded
+        node_id = self.tree.focus()
+        if not node_id:
+            return
+
+        children = self.tree.get_children(node_id)
+        
+        # If the first child is our dummy node, it means we need to load the data
+        if len(children) == 1 and self.tree.item(children[0], "text") == "__dummy__":
+            # Extract the actual frame name we hid inside the 'values' attribute
+            frame_name = self.tree.item(node_id, "values")[0]
+            logging.debug(f"Lazy loading triggered for Frame: {frame_name}")
+            
+            # Remove the dummy node
+            self.tree.delete(children[0])
+            
+            # Fetch the signals from our fast in-memory dictionary
+            signals = self.can_data.get(frame_name, [])
+            
+            # Populate the actual signals
+            for sig in signals:
+                self.tree.insert(node_id, tk.END, text=f"Signal: {sig}")
+                
+            logging.debug(f"Loaded {len(signals)} signals dynamically.")
 
     def on_select(self, event: tk.Event) -> None:
-        """Handle tree item selection events."""
+        """Callback to handle standard selection clicks."""
         selected_items = self.tree.selection()
-        logging.debug(f"Selection event. {len(selected_items)} item(s) currently selected.")
-        
-        for item in selected_items:
-            item_text = self.tree.item(item, "text")
-            logging.debug(f"Highlighted item: {item_text}")
+        if selected_items:
+            item_text = self.tree.item(selected_items[0], "text")
+            logging.debug(f"User highlighted: {item_text}")
 
     def next_step(self) -> None:
-        """Trigger the next feature execution."""
-        logging.info("'Execute Next Action' button clicked.")
-        logging.debug("Waiting for integration of the next pipeline stage.")
-
+        """Placeholder for the next processing pipeline."""
+        logging.info("'Execute Next Action' invoked.")
+        logging.debug("Ready for implementation of data export/processing logic.")
 
 if __name__ == "__main__":
-    logging.info("Booting up NI-XNET Database Selector application...")
+    logging.info("Starting application main event loop...")
     root = tk.Tk()
     app = CanDbSelectorApp(root)
     root.mainloop()
-    logging.info("Mainloop terminated. Application shut down cleanly.")
+    logging.info("Application shut down cleanly.")
