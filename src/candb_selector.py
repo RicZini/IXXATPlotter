@@ -25,8 +25,8 @@ class CanDbSelectorApp:
         self.root.geometry("600x500")
         
         # In-memory data store for parsed XML content
-        # Structure: { "Frame_Name": ["Signal1", "Signal2", ...] }
-        self.can_data: dict[str, list[str]] = {} 
+        # Structure: { "Frame_Name": {"id": "0x123", "signals": ["Signal1", "Signal2"]} }
+        self.can_data: dict[str, dict] = {} 
         
         self.setup_ui()
         logging.debug("GUI initialized and ready.")
@@ -87,7 +87,7 @@ class CanDbSelectorApp:
     def parse_xml(self, filepath: str) -> None:
         """
         Advanced FIBEX/AUTOSAR XML parser.
-        Resolves cross-references between FRAME -> PDU -> SIGNAL using IDs.
+        Resolves cross-references between FRAME-TRIGGERING -> FRAME -> PDU -> SIGNAL.
         """
         logging.info("Starting relational XML parser (FIBEX standard)...")
         self.can_data.clear()
@@ -120,12 +120,10 @@ class CanDbSelectorApp:
             pdu_map = {}
             pdu_elements = root.findall('.//PDU')
             
-            # Pass 2A: Extract direct signals within each PDU
             for pdu in pdu_elements:
                 pdu_id = pdu.get('ID')
                 signals = []
                 
-                # Find all signal references inside this PDU
                 for sig_ref in pdu.findall('.//SIGNAL-REF'):
                     ref_id = sig_ref.get('ID-REF')
                     if ref_id in signal_map:
@@ -134,47 +132,65 @@ class CanDbSelectorApp:
                 if pdu_id:
                     pdu_map[pdu_id] = signals
 
-            # Pass 2B: Resolve nested PDUs (Multiplexers)
-            # Some PDUs contain references to other PDUs (e.g. dpdu)
             for pdu in pdu_elements:
                 pdu_id = pdu.get('ID')
                 for pdu_ref in pdu.findall('.//PDU-REF'):
                     ref_id = pdu_ref.get('ID-REF')
-                    # If this PDU references another PDU, inherit its signals
                     if ref_id in pdu_map and pdu_id in pdu_map:
                         pdu_map[pdu_id].extend(pdu_map[ref_id])
 
             logging.debug(f"Mapped {len(pdu_map)} PDUs and resolved multiplexed references.")
+            
+            # --- STEP 2.5: Map Frame Triggerings to extract Hex CAN IDs ---
+            frame_id_map = {}
+            for trig in root.findall('.//FRAME-TRIGGERING'):
+                ident = trig.find('.//IDENTIFIER-VALUE')
+                f_ref = trig.find('.//FRAME-REF')
+                
+                if ident is not None and f_ref is not None and ident.text:
+                    try:
+                        # Convert string integer to Hex formatted string (e.g. 0x320)
+                        hex_val = f"0x{int(ident.text):03X}"
+                        frame_id_map[f_ref.get('ID-REF')] = hex_val
+                    except ValueError:
+                        frame_id_map[f_ref.get('ID-REF')] = "0x???"
+            
+            logging.debug(f"Mapped {len(frame_id_map)} Frame Identifiers.")
 
-            # --- STEP 3: Map Frames and link them to PDUs ---
+            # --- STEP 3: Map Frames and link them to IDs and PDUs ---
             frames = root.findall('.//FRAME')
             logging.info(f"Successfully extracted {len(frames)} FRAME definitions.")
             
             for frame in frames:
+                frame_node_id = frame.get('ID')
                 frame_name_elem = frame.find('.//SHORT-NAME')
                 if frame_name_elem is None:
                     frame_name_elem = frame.find('NAME')
                     
                 frame_name = frame_name_elem.text.strip() if frame_name_elem is not None else "Unknown_Frame"
+                
+                # Fetch Hex ID from triggerings mapping, fallback to N/A if not found
+                can_id_hex = frame_id_map.get(frame_node_id, "N/A")
+                
                 frame_signals = []
                 
-                # A Frame references PDUs. We fetch the signals mapped to those PDUs.
                 for pdu_ref in frame.findall('.//PDU-REF'):
                     ref_id = pdu_ref.get('ID-REF')
                     if ref_id in pdu_map:
                         frame_signals.extend(pdu_map[ref_id])
                 
-                # Remove any duplicates (caused by complex multiplexing) and assign to main dictionary
-                # dict.fromkeys() is the fastest, order-preserving way to remove duplicates in Python
-                self.can_data[frame_name] = list(dict.fromkeys(frame_signals))
+                # Store object with id and deduplicated signals
+                self.can_data[frame_name] = {
+                    'id': can_id_hex,
+                    'signals': list(dict.fromkeys(frame_signals))
+                }
                 
-                logging.debug(f"  --> Frame [{frame_name}] mapped with {len(self.can_data[frame_name])} signals.")
+                logging.debug(f"  --> Frame [{frame_name}] (ID: {can_id_hex}) mapped with {len(self.can_data[frame_name]['signals'])} signals.")
             
             if not self.can_data:
                 logging.warning("No frames found. Verify the file structure.")
-                self.can_data["[Error] Setup failed"] = ["Invalid schema"]
+                self.can_data["[Error] Setup failed"] = {'id': 'N/A', 'signals': ["Invalid schema"]}
                 
-            # Initialize User Interface components
             self.populate_tree_base()
             
         except ET.ParseError as e:
@@ -192,9 +208,17 @@ class CanDbSelectorApp:
             self.tree.delete(item)
             
         logging.debug("Populating root Frame nodes (Lazy Loading strategy)...")
-        for frame in self.can_data.keys():
+        for frame_name, data in self.can_data.items():
+            
+            can_id = data.get('id', 'N/A')
+            # Generate the professional string: ID: 0x... - FrameName
+            if can_id != 'N/A':
+                node_text = f"ID: {can_id}  |  Frame: {frame_name}"
+            else:
+                node_text = f"Frame: {frame_name}"
+            
             # Store the frame key in the 'values' tuple to retrieve it easily later
-            frame_id = self.tree.insert("", tk.END, text=f"Frame: {frame}", values=(frame,), open=False)
+            frame_id = self.tree.insert("", tk.END, text=node_text, values=(frame_name,), open=False)
             
             # Insert a dummy child to force tkinter to draw the expand [+] icon
             self.tree.insert(frame_id, tk.END, text="__dummy__")
@@ -222,8 +246,9 @@ class CanDbSelectorApp:
             # Remove the dummy node
             self.tree.delete(children[0])
             
-            # Fetch the signals from our fast in-memory dictionary
-            signals = self.can_data.get(frame_name, [])
+            # Fetch the signals from our structured in-memory dictionary
+            frame_data = self.can_data.get(frame_name, {})
+            signals = frame_data.get('signals', [])
             
             # Populate the actual signals
             for sig in signals:
