@@ -6,6 +6,7 @@ import logging
 import matplotlib.pyplot as plt
 
 from src.can_log_parser import CanLogParser
+from src.can_decoder import CanDecoder
 
 class CanDbSelectorApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -53,8 +54,7 @@ class CanDbSelectorApp:
     def load_csv(self) -> None:
         filepath = filedialog.askopenfilename(title="Select IXXAT CSV", filetypes=(("CSV files", "*.csv"), ("All files", "*.*")))
         if filepath:
-            success = self.log_parser.load_csv(filepath)
-            if success:
+            if self.log_parser.load_csv(filepath):
                 self.lbl_csv.config(text=f"{os.path.basename(filepath)} ({self.log_parser.total_messages} msgs)", fg="black")
                 self.csv_loaded = True
 
@@ -65,154 +65,231 @@ class CanDbSelectorApp:
             self.parse_xml(filepath)
 
     def parse_xml(self, filepath: str) -> None:
-        logging.info(f"Avvio parsing XML robusto: {filepath}")
+        logging.info("Avvio parsing XML Relazionale FIBEX...")
         self.can_data.clear()
         
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
-            
-            # 1. Normalizzazione namespace
             for elem in root.iter():
-                if '}' in elem.tag:
-                    elem.tag = elem.tag.split('}', 1)[1]
-            
-            # Funzione Helper infallibile per trovare i nomi
-            def get_name(node):
-                for child in node.iter('SHORT-NAME'):
-                    if child.text: return child.text.strip()
-                for child in node.iter('NAME'):
-                    if child.text: return child.text.strip()
-                return None
+                if '}' in elem.tag: elem.tag = elem.tag.split('}', 1)[1]
 
-            # 2. Mappatura Segnali
-            signal_map = {}
+            # 1. CODING (Matematica)
+            codings = {}
+            for c in root.iter('CODING'):
+                c_id = c.get('ID')
+                if not c_id: continue
+                bl = int(c.find('.//BIT-LENGTH').text) if c.find('.//BIT-LENGTH') is not None else 8
+                f = 1.0; o = 0.0
+                num = c.find('.//COMPU-RATIONAL-COEFFS/COMPU-NUMERATOR')
+                if num is not None:
+                    v_elems = list(num.iter('V'))
+                    if len(v_elems) >= 1 and v_elems[0].text: o = float(v_elems[0].text)
+                    if len(v_elems) >= 2 and v_elems[1].text: f = float(v_elems[1].text)
+                codings[c_id] = {"bit_length": bl, "factor": f, "offset": o}
+
+            # 2. SEGNALI BASE
+            signals = {}
             for sig in root.iter('SIGNAL'):
-                sig_id = sig.get('ID')
-                sig_name = get_name(sig)
-                if sig_id and sig_name:
-                    signal_map[sig_id] = sig_name
-            logging.debug(f"Mappati {len(signal_map)} segnali fisici.")
+                s_name = next((c.text.strip() for c in sig.iter('SHORT-NAME') if c.text), None)
+                if not s_name: s_name = next((c.text.strip() for c in sig.iter('NAME') if c.text), None)
+                c_ref = sig.find('.//CODING-REF')
+                if sig.get('ID') and s_name: 
+                    signals[sig.get('ID')] = {"name": s_name, "coding_id": c_ref.get('ID-REF') if c_ref is not None else None}
 
-            # 3. Mappatura PDU
-            pdu_map = {}
-            pdu_elements = list(root.iter('PDU'))
-            for pdu in pdu_elements:
-                pdu_id = pdu.get('ID')
-                sigs = [signal_map[s.get('ID-REF')] for s in pdu.iter('SIGNAL-REF') if s.get('ID-REF') in signal_map]
-                if pdu_id: pdu_map[pdu_id] = sigs
+            # 3. START BITS
+            start_bits = {}
+            for parent in root.iter():
+                bp = parent.find('./BIT-POSITION')
+                sr = parent.find('./SIGNAL-REF')
+                if bp is not None and sr is not None and bp.text:
+                    start_bits[sr.get('ID-REF')] = int(bp.text.strip())
 
-            for pdu in pdu_elements:
-                pdu_id = pdu.get('ID')
-                for p_ref in pdu.iter('PDU-REF'):
-                    r_id = p_ref.get('ID-REF')
-                    if r_id in pdu_map and pdu_id in pdu_map:
-                        pdu_map[pdu_id].extend(pdu_map[r_id])
+            # 4. PDU ANALYSIS (Struttura Multiplexing)
+            pdu_direct_signals = {}
+            pdu_mux_roots = {}
+            pdu_dynamic_links = {}
 
-            # 4. Mappatura ID Esadecimali
+            for pdu in root.iter('PDU'):
+                p_id = pdu.get('ID')
+                
+                # Segnali diretti
+                pdu_direct_signals[p_id] = [sr.get('ID-REF') for sr in pdu.iter('SIGNAL-REF') if sr.get('ID-REF')]
+                
+                # Cerca Multiplexer Root
+                switch = pdu.find('.//MULTIPLEXER/SWITCH')
+                if switch is not None:
+                    m_name = switch.find('./SHORT-NAME').text.strip()
+                    m_sb = int(switch.find('./BIT-POSITION').text)
+                    m_bl = int(switch.find('./BIT-LENGTH').text)
+                    pdu_mux_roots[p_id] = {"name": m_name, "start_bit": m_sb, "bit_length": m_bl}
+
+                # Cerca Dynamic Links
+                links = []
+                for spi in pdu.iter('SWITCHED-PDU-INSTANCE'):
+                    code = spi.find('./SWITCH-CODE')
+                    p_ref = spi.find('./PDU-REF')
+                    if code is not None and p_ref is not None and code.text:
+                        links.append({"code": code.text.strip(), "pdu_ref": p_ref.get('ID-REF')})
+                pdu_dynamic_links[p_id] = links
+
+            # 5. ID TRIGGERING
             frame_id_map = {}
             for trig in root.iter('FRAME-TRIGGERING'):
                 ident = next((c.text for c in trig.iter('IDENTIFIER-VALUE') if c.text), None)
                 f_ref = next((c.get('ID-REF') for c in trig.iter('FRAME-REF')), None)
-                if ident and f_ref:
-                    try:
-                        frame_id_map[f_ref] = f"0x{int(ident):03X}"
-                    except ValueError:
-                        pass
+                if ident and f_ref: frame_id_map[f_ref] = f"0x{int(ident):03X}"
 
-            # 5. Costruzione Finale Dizionario
-            frames_count = 0
+            # 6. FRAME ASSEMBLY
             for frame in root.iter('FRAME'):
                 f_id = frame.get('ID')
                 if not f_id: continue
                 
-                frames_count += 1
-                # Se il nome manca, garantisce una chiave univoca usando l'ID del nodo!
-                frame_name = get_name(frame) or f"Unknown_Frame_{f_id}"
+                f_name = next((c.text.strip() for c in frame.iter('SHORT-NAME') if c.text), f"Unknown_{f_id}")
                 can_id = frame_id_map.get(f_id, "N/A")
-                
-                f_sigs = []
+                frame_signals = {}
+
                 for p_ref in frame.iter('PDU-REF'):
-                    r_id = p_ref.get('ID-REF')
-                    if r_id in pdu_map: f_sigs.extend(pdu_map[r_id])
-                
-                self.can_data[frame_name] = {
-                    'id': can_id,
-                    'signals': list(dict.fromkeys(f_sigs))
-                }
+                    root_pdu_id = p_ref.get('ID-REF')
+                    
+                    # 6.a Controlla se questa PDU comanda un Multiplexer
+                    frame_mux_info = pdu_mux_roots.get(root_pdu_id, None)
+
+                    # 6.b Aggiungi i segnali single (non multiplexati)
+                    for s_ref in pdu_direct_signals.get(root_pdu_id, []):
+                        if s_ref not in signals: continue
+                        sig_name = signals[s_ref]["name"]
+                        
+                        # SCARTA IL SEGNALE MULTIPLEXER DALLA GUI
+                        if frame_mux_info and sig_name == frame_mux_info["name"]:
+                            continue
+                            
+                        cod = codings.get(signals[s_ref]["coding_id"], {})
+                        frame_signals[sig_name] = {
+                            "role": "single",
+                            "start_bit": start_bits.get(s_ref, 0),
+                            "bit_length": cod.get("bit_length", 8),
+                            "factor": cod.get("factor", 1.0),
+                            "offset": cod.get("offset", 0.0),
+                            "mux_code": None,
+                            "mux_ctrl": None
+                        }
+
+                    # 6.c Aggiungi i segnali Multiplexed dalle PDU dinamiche
+                    for link in pdu_dynamic_links.get(root_pdu_id, []):
+                        dyn_pdu_id = link["pdu_ref"]
+                        switch_code = link["code"]
+                        
+                        for s_ref in pdu_direct_signals.get(dyn_pdu_id, []):
+                            if s_ref not in signals: continue
+                            sig_name = signals[s_ref]["name"]
+                            cod = codings.get(signals[s_ref]["coding_id"], {})
+                            
+                            frame_signals[sig_name] = {
+                                "role": "multiplexed",
+                                "start_bit": start_bits.get(s_ref, 0),
+                                "bit_length": cod.get("bit_length", 8),
+                                "factor": cod.get("factor", 1.0),
+                                "offset": cod.get("offset", 0.0),
+                                "mux_code": int(switch_code) if switch_code.isdigit() else switch_code,
+                                "mux_ctrl": frame_mux_info # Alleghiamo direttamente le info dell'offset!
+                            }
+
+                self.can_data[f_name] = {'id': can_id, 'signals': frame_signals}
             
-            logging.info(f"Parsing XML completato: {frames_count} Frame validi inseriti in memoria.")
+            logging.info("XML Parser completato. GUI in aggiornamento.")
             self.populate_tree_base()
             
         except Exception as e:
-            logging.error(f"Errore critico durante il parsing: {e}", exc_info=True)
-            messagebox.showerror("Errore XML", f"Errore nel processare il database: {e}")
+            logging.error(f"Errore XML: {e}", exc_info=True)
+            messagebox.showerror("Errore XML", str(e))
 
     def populate_tree_base(self) -> None:
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        for item in self.tree.get_children(): self.tree.delete(item)
         for frame_name, data in sorted(self.can_data.items()):
-            can_id = data['id']
-            node_id = self.tree.insert("", tk.END, text=f"ID: {can_id} | Frame: {frame_name}", values=(frame_name, can_id))
+            node_id = self.tree.insert("", tk.END, text=f"ID: {data['id']} | Frame: {frame_name}", values=(frame_name, data['id']))
             self.tree.insert(node_id, tk.END, text="__dummy__")
 
     def on_frame_expand(self, event: tk.Event) -> None:
         node_id = self.tree.focus()
         if not node_id: return
-        
-        logging.debug(f"[{node_id}] Evento Espansione attivato.")
         children = self.tree.get_children(node_id)
-        
         if len(children) == 1 and self.tree.item(children[0], "text") == "__dummy__":
             vals = self.tree.item(node_id, "values")
-            if len(vals) < 2: return
             frame_name, can_id = vals[0], vals[1]
-            
-            logging.debug(f"Caricamento Segnali per: {frame_name} ({can_id})")
             self.tree.delete(children[0])
             
-            signals = self.can_data.get(frame_name, {}).get('signals', [])
-            if not signals:
-                self.tree.insert(node_id, tk.END, text="[Nessun Segnale Mappato]")
-                logging.debug("--> Nessun segnale all'interno.")
-                return
-                
-            for sig in signals:
-                self.tree.insert(node_id, tk.END, text=f"Signal: {sig}", values=("SIGNAL", sig, can_id, frame_name))
-            logging.debug(f"--> Inseriti {len(signals)} segnali.")
+            signals = self.can_data.get(frame_name, {}).get('signals', {})
+            for sig_name in sorted(signals.keys()):
+                # Niente più icone
+                self.tree.insert(node_id, tk.END, text=sig_name, values=("SIGNAL", sig_name, can_id, frame_name))
 
     def on_double_click(self, event: tk.Event) -> None:
         node_id = self.tree.focus()
         if not node_id: return
-        
         vals = self.tree.item(node_id, "values")
-        logging.debug(f"Doppio Click rilevato: Valori Nodo -> {vals}")
-        
         if len(vals) == 4 and vals[0] == "SIGNAL":
-            logging.debug("E' un segnale! Avvio plot...")
             self.plot_signal(vals[1], vals[2], vals[3])
-        else:
-            logging.debug("Non e' una foglia 'Segnale', plot ignorato.")
 
     def plot_signal(self, sig_name: str, can_id: str, frame_name: str) -> None:
-        if not self.csv_loaded:
-            messagebox.showwarning("Dati mancanti", "Carica prima il file CSV.")
-            return
-        if can_id not in self.log_parser.log_data:
-            messagebox.showinfo("Nessun Dato", f"L'ID {can_id} non è presente nel file CSV caricato.")
-            return
-            
+        if not self.csv_loaded: return messagebox.showwarning("Dati", "Carica il CSV.")
+        if can_id not in self.log_parser.log_data: return messagebox.showinfo("Dati", f"ID {can_id} non nel CSV.")
+        
+        sig_info = self.can_data[frame_name]['signals'][sig_name]
+        role = sig_info['role']
+
         times = self.log_parser.log_data[can_id]["time"]
         payloads = self.log_parser.log_data[can_id]["data"]
         
-        # Estraggo temporaneamente il primo byte per provare il grafico
-        values = [p[0] if len(p) > 0 else 0 for p in payloads]
+        plot_times = []
+        plot_values = []
 
-        plt.figure(figsize=(8, 4))
-        plt.plot(times, values, label=f"{sig_name} (Byte 0 Raw)", color='blue')
-        plt.title(f"{sig_name} @ {frame_name} ({can_id})")
+        for i, payload in enumerate(payloads):
+            if not payload: continue
+
+            # 1. FILTRO MULTIPLEXING
+            if role == 'multiplexed':
+                mux_ctrl = sig_info.get('mux_ctrl')
+                if not mux_ctrl: 
+                    continue # Se manca il controller, la riga è illeggibile, la scarto
+                
+                # Estrae il valore dell'offset corrente dal payload
+                current_mux_val = CanDecoder.extract_raw_value(
+                    payload, 
+                    start_bit=mux_ctrl['start_bit'], 
+                    bit_length=mux_ctrl['bit_length']
+                )
+                
+                # Se l'offset letto non coincide con il codice di sblocco della cella, salta il pacchetto!
+                if str(current_mux_val) != str(sig_info['mux_code']):
+                    continue 
+
+            # 2. ESTRAZIONE VALORE
+            raw_val = CanDecoder.extract_raw_value(
+                payload, 
+                start_bit=sig_info['start_bit'], 
+                bit_length=sig_info['bit_length']
+            )
+            
+            # 3. SCALING
+            phys_val = CanDecoder.apply_scaling(raw_val, factor=sig_info['factor'], offset=sig_info['offset'])
+
+            plot_times.append(times[i])
+            plot_values.append(phys_val)
+
+        if not plot_values:
+            messagebox.showinfo("Nessun dato", "Il segnale richiesto non è mai apparso in questo log CSV (Offset mai attivato).")
+            return
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(plot_times, plot_values, label=f"{sig_name}", color='#2c3e50', linewidth=1.5)
+        
+        info_str = f"Bit:{sig_info['start_bit']} | Len:{sig_info['bit_length']} | MuxCode:{sig_info.get('mux_code', 'N/A')} | Factor:{sig_info['factor']}"
+        plt.title(f"{sig_name}  [{frame_name}]", fontsize=12)
+        plt.suptitle(info_str, fontsize=9, color='gray', y=0.92)
+        
         plt.xlabel("Tempo (s)")
-        plt.ylabel("Valore (Raw)")
-        plt.grid(True)
-        plt.legend()
+        plt.ylabel("Valore")
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
         plt.show(block=False)
