@@ -1,269 +1,218 @@
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, ttk, messagebox
 import xml.etree.ElementTree as ET
 import os
 import logging
+import matplotlib.pyplot as plt
 
-# Configure standard logging for clear, professional console output
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+from src.can_log_parser import CanLogParser
 
 class CanDbSelectorApp:
-    """
-    Python Desktop Application to parse and selectively load 
-    NI-XNET CAN Database XML files (FIBEX format).
-    Implements Lazy Loading to ensure UI responsiveness with large datasets.
-    """
-
     def __init__(self, root: tk.Tk) -> None:
-        """Initialize the main application window and application state."""
-        logging.debug("Initializing CanDbSelectorApp...")
+        logging.debug("Initializing Integrated CAN Explorer...")
         self.root = root
-        self.root.title("NI-XNET CAN Database Selector")
-        self.root.geometry("600x500")
+        self.root.title("NI-XNET CAN Explorer & Telemetry")
+        self.root.geometry("700x600")
         
-        # In-memory data store for parsed XML content
-        # Structure: { "Frame_Name": {"id": "0x123", "signals": ["Signal1", "Signal2"]} }
         self.can_data: dict[str, dict] = {} 
+        self.log_parser = CanLogParser()
+        self.csv_loaded = False
         
         self.setup_ui()
-        logging.debug("GUI initialized and ready.")
 
     def setup_ui(self) -> None:
-        """Construct the Tkinter widget layout."""
-        # --- Top Frame: File Selection ---
         top_frame = tk.Frame(self.root)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
         
-        self.btn_load = tk.Button(top_frame, text="Load XML Database", command=self.load_file)
-        self.btn_load.pack(side=tk.LEFT)
+        row_csv = tk.Frame(top_frame)
+        row_csv.pack(side=tk.TOP, fill=tk.X, pady=2)
+        tk.Button(row_csv, text="1. Load IXXAT CSV (Dati)", command=self.load_csv, width=25, bg="lightblue").pack(side=tk.LEFT)
+        self.lbl_csv = tk.Label(row_csv, text="Nessun dato caricato", fg="gray")
+        self.lbl_csv.pack(side=tk.LEFT, padx=10)
         
-        self.lbl_file = tk.Label(top_frame, text="No file selected", fg="gray")
-        self.lbl_file.pack(side=tk.LEFT, padx=10)
+        row_xml = tk.Frame(top_frame)
+        row_xml.pack(side=tk.TOP, fill=tk.X, pady=2)
+        tk.Button(row_xml, text="2. Load NI-XNET XML (Database)", command=self.load_xml, width=25, bg="lightgreen").pack(side=tk.LEFT)
+        self.lbl_xml = tk.Label(row_xml, text="Nessun database selezionato", fg="gray")
+        self.lbl_xml.pack(side=tk.LEFT, padx=10)
         
-        # --- Middle Frame: Treeview for CAN Hierarchy ---
         mid_frame = tk.Frame(self.root)
         mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        self.tree = ttk.Treeview(mid_frame, selectmode="extended")
-        self.tree.heading("#0", text="CAN Frames and Signals", anchor=tk.W)
+        self.tree = ttk.Treeview(mid_frame, selectmode="browse")
+        self.tree.heading("#0", text="CAN Architecture (Doppio click su Segnale per Plot)", anchor=tk.W)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         scrollbar = ttk.Scrollbar(mid_frame, orient="vertical", command=self.tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.configure(yscrollcommand=scrollbar.set)
         
-        # Bind events for Lazy Loading and selection tracking
         self.tree.bind("<<TreeviewOpen>>", self.on_frame_expand)
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Double-1>", self.on_double_click)
         
-        # --- Bottom Frame: Next Action ---
-        bot_frame = tk.Frame(self.root)
-        bot_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
-        
-        self.btn_next = tk.Button(bot_frame, text="Execute Next Action", command=self.next_step, state=tk.DISABLED)
-        self.btn_next.pack(side=tk.RIGHT)
+    def load_csv(self) -> None:
+        filepath = filedialog.askopenfilename(title="Select IXXAT CSV", filetypes=(("CSV files", "*.csv"), ("All files", "*.*")))
+        if filepath:
+            success = self.log_parser.load_csv(filepath)
+            if success:
+                self.lbl_csv.config(text=f"{os.path.basename(filepath)} ({self.log_parser.total_messages} msgs)", fg="black")
+                self.csv_loaded = True
 
-    def load_file(self) -> None:
-        """Callback to open file dialog and initiate XML parsing."""
-        logging.debug("File selection dialog opened by user.")
-        filepath = filedialog.askopenfilename(
-            title="Select NI-XNET XML Database",
-            filetypes=(("XML files", "*.xml"), ("All files", "*.*"))
-        )
-        
-        if not filepath:
-            logging.debug("File selection cancelled.")
-            return
-            
-        logging.info(f"Selected file: {filepath}")
-        self.lbl_file.config(text=os.path.basename(filepath), fg="black")
-        
-        self.btn_next.config(state=tk.NORMAL)
-        self.parse_xml(filepath)
+    def load_xml(self) -> None:
+        filepath = filedialog.askopenfilename(title="Select NI-XNET XML", filetypes=(("XML files", "*.xml"), ("All files", "*.*")))
+        if filepath:
+            self.lbl_xml.config(text=os.path.basename(filepath), fg="black")
+            self.parse_xml(filepath)
 
     def parse_xml(self, filepath: str) -> None:
-        """
-        Advanced FIBEX/AUTOSAR XML parser.
-        Resolves cross-references between FRAME-TRIGGERING -> FRAME -> PDU -> SIGNAL.
-        """
-        logging.info("Starting relational XML parser (FIBEX standard)...")
+        logging.info(f"Avvio parsing XML robusto: {filepath}")
         self.can_data.clear()
         
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
             
-            # Normalize tags by stripping XML namespaces to simplify searching
+            # 1. Normalizzazione namespace
             for elem in root.iter():
                 if '}' in elem.tag:
                     elem.tag = elem.tag.split('}', 1)[1]
             
-            logging.debug("Namespaces stripped. Building relational memory maps...")
+            # Funzione Helper infallibile per trovare i nomi
+            def get_name(node):
+                for child in node.iter('SHORT-NAME'):
+                    if child.text: return child.text.strip()
+                for child in node.iter('NAME'):
+                    if child.text: return child.text.strip()
+                return None
 
-            # --- STEP 1: Map all Signals (ID -> Name) ---
+            # 2. Mappatura Segnali
             signal_map = {}
-            for sig in root.findall('.//SIGNAL'):
+            for sig in root.iter('SIGNAL'):
                 sig_id = sig.get('ID')
-                name_elem = sig.find('.//SHORT-NAME')
-                if name_elem is None:
-                    name_elem = sig.find('NAME')
-                    
-                if sig_id and name_elem is not None and name_elem.text:
-                    signal_map[sig_id] = name_elem.text.strip()
-                    
-            logging.debug(f"Mapped {len(signal_map)} distinct Signals.")
+                sig_name = get_name(sig)
+                if sig_id and sig_name:
+                    signal_map[sig_id] = sig_name
+            logging.debug(f"Mappati {len(signal_map)} segnali fisici.")
 
-            # --- STEP 2: Map all PDUs (ID -> List of Signal Names) ---
+            # 3. Mappatura PDU
             pdu_map = {}
-            pdu_elements = root.findall('.//PDU')
-            
+            pdu_elements = list(root.iter('PDU'))
             for pdu in pdu_elements:
                 pdu_id = pdu.get('ID')
-                signals = []
-                
-                for sig_ref in pdu.findall('.//SIGNAL-REF'):
-                    ref_id = sig_ref.get('ID-REF')
-                    if ref_id in signal_map:
-                        signals.append(signal_map[ref_id])
-                
-                if pdu_id:
-                    pdu_map[pdu_id] = signals
+                sigs = [signal_map[s.get('ID-REF')] for s in pdu.iter('SIGNAL-REF') if s.get('ID-REF') in signal_map]
+                if pdu_id: pdu_map[pdu_id] = sigs
 
             for pdu in pdu_elements:
                 pdu_id = pdu.get('ID')
-                for pdu_ref in pdu.findall('.//PDU-REF'):
-                    ref_id = pdu_ref.get('ID-REF')
-                    if ref_id in pdu_map and pdu_id in pdu_map:
-                        pdu_map[pdu_id].extend(pdu_map[ref_id])
+                for p_ref in pdu.iter('PDU-REF'):
+                    r_id = p_ref.get('ID-REF')
+                    if r_id in pdu_map and pdu_id in pdu_map:
+                        pdu_map[pdu_id].extend(pdu_map[r_id])
 
-            logging.debug(f"Mapped {len(pdu_map)} PDUs and resolved multiplexed references.")
-            
-            # --- STEP 2.5: Map Frame Triggerings to extract Hex CAN IDs ---
+            # 4. Mappatura ID Esadecimali
             frame_id_map = {}
-            for trig in root.findall('.//FRAME-TRIGGERING'):
-                ident = trig.find('.//IDENTIFIER-VALUE')
-                f_ref = trig.find('.//FRAME-REF')
-                
-                if ident is not None and f_ref is not None and ident.text:
+            for trig in root.iter('FRAME-TRIGGERING'):
+                ident = next((c.text for c in trig.iter('IDENTIFIER-VALUE') if c.text), None)
+                f_ref = next((c.get('ID-REF') for c in trig.iter('FRAME-REF')), None)
+                if ident and f_ref:
                     try:
-                        # Convert string integer to Hex formatted string (e.g. 0x320)
-                        hex_val = f"0x{int(ident.text):03X}"
-                        frame_id_map[f_ref.get('ID-REF')] = hex_val
+                        frame_id_map[f_ref] = f"0x{int(ident):03X}"
                     except ValueError:
-                        frame_id_map[f_ref.get('ID-REF')] = "0x???"
-            
-            logging.debug(f"Mapped {len(frame_id_map)} Frame Identifiers.")
+                        pass
 
-            # --- STEP 3: Map Frames and link them to IDs and PDUs ---
-            frames = root.findall('.//FRAME')
-            logging.info(f"Successfully extracted {len(frames)} FRAME definitions.")
-            
-            for frame in frames:
-                frame_node_id = frame.get('ID')
-                frame_name_elem = frame.find('.//SHORT-NAME')
-                if frame_name_elem is None:
-                    frame_name_elem = frame.find('NAME')
-                    
-                frame_name = frame_name_elem.text.strip() if frame_name_elem is not None else "Unknown_Frame"
+            # 5. Costruzione Finale Dizionario
+            frames_count = 0
+            for frame in root.iter('FRAME'):
+                f_id = frame.get('ID')
+                if not f_id: continue
                 
-                # Fetch Hex ID from triggerings mapping, fallback to N/A if not found
-                can_id_hex = frame_id_map.get(frame_node_id, "N/A")
+                frames_count += 1
+                # Se il nome manca, garantisce una chiave univoca usando l'ID del nodo!
+                frame_name = get_name(frame) or f"Unknown_Frame_{f_id}"
+                can_id = frame_id_map.get(f_id, "N/A")
                 
-                frame_signals = []
+                f_sigs = []
+                for p_ref in frame.iter('PDU-REF'):
+                    r_id = p_ref.get('ID-REF')
+                    if r_id in pdu_map: f_sigs.extend(pdu_map[r_id])
                 
-                for pdu_ref in frame.findall('.//PDU-REF'):
-                    ref_id = pdu_ref.get('ID-REF')
-                    if ref_id in pdu_map:
-                        frame_signals.extend(pdu_map[ref_id])
-                
-                # Store object with id and deduplicated signals
                 self.can_data[frame_name] = {
-                    'id': can_id_hex,
-                    'signals': list(dict.fromkeys(frame_signals))
+                    'id': can_id,
+                    'signals': list(dict.fromkeys(f_sigs))
                 }
-                
-                logging.debug(f"  --> Frame [{frame_name}] (ID: {can_id_hex}) mapped with {len(self.can_data[frame_name]['signals'])} signals.")
             
-            if not self.can_data:
-                logging.warning("No frames found. Verify the file structure.")
-                self.can_data["[Error] Setup failed"] = {'id': 'N/A', 'signals': ["Invalid schema"]}
-                
+            logging.info(f"Parsing XML completato: {frames_count} Frame validi inseriti in memoria.")
             self.populate_tree_base()
             
-        except ET.ParseError as e:
-            logging.error(f"XML parsing failed: {e}")
         except Exception as e:
-            logging.error(f"Unexpected error during parsing: {e}", exc_info=True)
+            logging.error(f"Errore critico durante il parsing: {e}", exc_info=True)
+            messagebox.showerror("Errore XML", f"Errore nel processare il database: {e}")
 
     def populate_tree_base(self) -> None:
-        """
-        Populate only the root nodes (Frames) in the Treeview.
-        Injects a dummy node to enable the expand arrow for lazy loading.
-        """
-        logging.debug("Clearing previous Treeview contents...")
         for item in self.tree.get_children():
             self.tree.delete(item)
-            
-        logging.debug("Populating root Frame nodes (Lazy Loading strategy)...")
-        for frame_name, data in self.can_data.items():
-            
-            can_id = data.get('id', 'N/A')
-            # Generate the professional string: ID: 0x... - FrameName
-            if can_id != 'N/A':
-                node_text = f"ID: {can_id}  |  Frame: {frame_name}"
-            else:
-                node_text = f"Frame: {frame_name}"
-            
-            # Store the frame key in the 'values' tuple to retrieve it easily later
-            frame_id = self.tree.insert("", tk.END, text=node_text, values=(frame_name,), open=False)
-            
-            # Insert a dummy child to force tkinter to draw the expand [+] icon
-            self.tree.insert(frame_id, tk.END, text="__dummy__")
-                
-        logging.info("Treeview base layer populated.")
+        for frame_name, data in sorted(self.can_data.items()):
+            can_id = data['id']
+            node_id = self.tree.insert("", tk.END, text=f"ID: {can_id} | Frame: {frame_name}", values=(frame_name, can_id))
+            self.tree.insert(node_id, tk.END, text="__dummy__")
 
     def on_frame_expand(self, event: tk.Event) -> None:
-        """
-        Callback triggered when a user expands a node.
-        Checks for the dummy node, removes it, and loads actual Signals on the fly.
-        """
-        # Get the ID of the node being expanded
         node_id = self.tree.focus()
-        if not node_id:
-            return
-
+        if not node_id: return
+        
+        logging.debug(f"[{node_id}] Evento Espansione attivato.")
         children = self.tree.get_children(node_id)
         
-        # If the first child is our dummy node, it means we need to load the data
         if len(children) == 1 and self.tree.item(children[0], "text") == "__dummy__":
-            # Extract the actual frame name we hid inside the 'values' attribute
-            frame_name = self.tree.item(node_id, "values")[0]
-            logging.debug(f"Lazy loading triggered for Frame: {frame_name}")
+            vals = self.tree.item(node_id, "values")
+            if len(vals) < 2: return
+            frame_name, can_id = vals[0], vals[1]
             
-            # Remove the dummy node
+            logging.debug(f"Caricamento Segnali per: {frame_name} ({can_id})")
             self.tree.delete(children[0])
             
-            # Fetch the signals from our structured in-memory dictionary
-            frame_data = self.can_data.get(frame_name, {})
-            signals = frame_data.get('signals', [])
-            
-            # Populate the actual signals
-            for sig in signals:
-                self.tree.insert(node_id, tk.END, text=f"Signal: {sig}")
+            signals = self.can_data.get(frame_name, {}).get('signals', [])
+            if not signals:
+                self.tree.insert(node_id, tk.END, text="[Nessun Segnale Mappato]")
+                logging.debug("--> Nessun segnale all'interno.")
+                return
                 
-            logging.debug(f"Loaded {len(signals)} signals dynamically.")
+            for sig in signals:
+                self.tree.insert(node_id, tk.END, text=f"Signal: {sig}", values=("SIGNAL", sig, can_id, frame_name))
+            logging.debug(f"--> Inseriti {len(signals)} segnali.")
 
-    def on_select(self, event: tk.Event) -> None:
-        """Callback to handle standard selection clicks."""
-        selected_items = self.tree.selection()
-        if selected_items:
-            item_text = self.tree.item(selected_items[0], "text")
-            logging.debug(f"User highlighted: {item_text}")
+    def on_double_click(self, event: tk.Event) -> None:
+        node_id = self.tree.focus()
+        if not node_id: return
+        
+        vals = self.tree.item(node_id, "values")
+        logging.debug(f"Doppio Click rilevato: Valori Nodo -> {vals}")
+        
+        if len(vals) == 4 and vals[0] == "SIGNAL":
+            logging.debug("E' un segnale! Avvio plot...")
+            self.plot_signal(vals[1], vals[2], vals[3])
+        else:
+            logging.debug("Non e' una foglia 'Segnale', plot ignorato.")
 
-    def next_step(self) -> None:
-        """Placeholder for the next processing pipeline."""
-        logging.info("'Execute Next Action' invoked.")
-        logging.debug("Ready for implementation of data export/processing logic.")
+    def plot_signal(self, sig_name: str, can_id: str, frame_name: str) -> None:
+        if not self.csv_loaded:
+            messagebox.showwarning("Dati mancanti", "Carica prima il file CSV.")
+            return
+        if can_id not in self.log_parser.log_data:
+            messagebox.showinfo("Nessun Dato", f"L'ID {can_id} non è presente nel file CSV caricato.")
+            return
+            
+        times = self.log_parser.log_data[can_id]["time"]
+        payloads = self.log_parser.log_data[can_id]["data"]
+        
+        # Estraggo temporaneamente il primo byte per provare il grafico
+        values = [p[0] if len(p) > 0 else 0 for p in payloads]
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(times, values, label=f"{sig_name} (Byte 0 Raw)", color='blue')
+        plt.title(f"{sig_name} @ {frame_name} ({can_id})")
+        plt.xlabel("Tempo (s)")
+        plt.ylabel("Valore (Raw)")
+        plt.grid(True)
+        plt.legend()
+        plt.show(block=False)

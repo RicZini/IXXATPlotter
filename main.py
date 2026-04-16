@@ -1,40 +1,69 @@
 import tkinter as tk
+from tkinter import ttk
 import logging
-# Importiamo la classe dal file rinominato cand_selector.py all'interno di src/
+import matplotlib.pyplot as plt
+
+# Importiamo l'applicazione dal nostro modulo sorgente
 from src.candb_selector import CanDbSelectorApp
+
+def setup_professional_environment():
+    """
+    Configura le impostazioni grafiche globali per Matplotlib 
+    per dare ai plot un aspetto da software di telemetria professionale.
+    """
+    try:
+        # Usa uno stile pulito (ggplot o seaborn-darkgrid sono ottimi per i dati)
+        plt.style.use('ggplot')
+    except Exception:
+        pass # Fallback silenzioso allo stile base
+        
+    # Parametri globali per i grafici
+    plt.rcParams['figure.autolayout'] = True
+    plt.rcParams['lines.linewidth'] = 1.5
+    plt.rcParams['axes.titlesize'] = 12
+    plt.rcParams['axes.labelsize'] = 10
+    plt.rcParams['figure.facecolor'] = '#f4f4f4'
+    plt.rcParams['axes.facecolor'] = '#ffffff'
 
 def main():
     """
     Punto di ingresso principale dell'applicazione.
-    Configura il logging e avvia l'interfaccia grafica.
+    Gestisce il setup dell'ambiente, il logging e il ciclo di vita della GUI.
     """
-    
-    # Configurazione del logging professionale
-    # I messaggi verranno stampati in console con timestamp e livello di gravità
+    # 1. Setup del Logging
     logging.basicConfig(
         level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - [%(levelname)s] - %(message)s'
     )
     
-    logging.info("Starting NI-XNET CAN Explorer...")
+    logging.info("Avvio del tool di Telemetria NI-XNET/IXXAT...")
+    
+    # 2. Setup dell'ambiente Matplotlib
+    setup_professional_environment()
     
     try:
-        # Inizializzazione della finestra radice di Tkinter
+        # 3. Inizializzazione del motore grafico principale
         root = tk.Tk()
-        root.title("NI-XNET CAN Explorer v1.0")
         
-        # Istanza dell'applicazione passando la root
-        # La logica è contenuta in src/cand_selector.py
+        # 4. Miglioramento dell'estetica dell'interfaccia OS-native
+        style = ttk.Style()
+        # 'clam' o 'vista' o 'winnative' rendono i bottoni e i treeview molto più moderni
+        available_themes = style.theme_names()
+        if 'clam' in available_themes:
+            style.theme_use('clam')
+            
+        # 5. Avvio dell'Applicazione
         app = CanDbSelectorApp(root)
         
-        # Avvio del ciclo degli eventi (Main Loop)
-        # Questo blocca l'esecuzione finché la finestra non viene chiusa
+        # 6. Avvio del Loop degli Eventi (blocca l'esecuzione finché non si chiude la finestra)
         root.mainloop()
         
     except Exception as e:
-        logging.critical(f"A critical error occurred during startup: {e}", exc_info=True)
+        logging.critical(f"Errore fatale durante l'esecuzione: {e}", exc_info=True)
     finally:
-        logging.info("Application context terminated.")
+        # Si assicura che tutti i grafici aperti vengano chiusi quando si chiude il programma
+        plt.close('all')
+        logging.info("Applicazione terminata. Chiusura sicura dei processi.")
 
 if __name__ == "__main__":
     main()
