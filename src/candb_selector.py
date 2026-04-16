@@ -242,10 +242,3 @@ class CanDbSelectorApp:
         """Placeholder for the next processing pipeline."""
         logging.info("'Execute Next Action' invoked.")
         logging.debug("Ready for implementation of data export/processing logic.")
-
-if __name__ == "__main__":
-    logging.info("Starting application main event loop...")
-    root = tk.Tk()
-    app = CanDbSelectorApp(root)
-    root.mainloop()
-    logging.info("Application shut down cleanly.")
