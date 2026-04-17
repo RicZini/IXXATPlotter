@@ -10,3 +10,15 @@ __pycache__/
 # IDE configurations
 .vscode/
 .idea/
+
+# Logs and databases
+test.csv
+FSAEE_CAN_DB.xml
+
+# Test files
+test_xml_decoder.py
+
+# Assests and build files
+assets/logo.png
+assets/icon.ico
+build/*
