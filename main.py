@@ -1,23 +1,24 @@
 import tkinter as tk
 from tkinter import ttk
 import logging
+import argparse
 import matplotlib.pyplot as plt
 
-# Importiamo l'applicazione dal nostro modulo sorgente
+# Import the application from our source module
 from src.candb_selector import CanDbSelectorApp
 
 def setup_professional_environment():
     """
-    Configura le impostazioni grafiche globali per Matplotlib 
-    per dare ai plot un aspetto da software di telemetria professionale.
+    Configures global graphical settings for Matplotlib 
+    to give plots a professional telemetry software appearance.
     """
     try:
-        # Usa uno stile pulito (ggplot o seaborn-darkgrid sono ottimi per i dati)
+        # Use a clean style (ggplot or seaborn-darkgrid are excellent for data visualization)
         plt.style.use('ggplot')
     except Exception:
-        pass # Fallback silenzioso allo stile base
+        pass # Silent fallback to default style
         
-    # Parametri globali per i grafici
+    # Global parameters for plots
     plt.rcParams['figure.autolayout'] = True
     plt.rcParams['lines.linewidth'] = 1.5
     plt.rcParams['axes.titlesize'] = 12
@@ -27,43 +28,57 @@ def setup_professional_environment():
 
 def main():
     """
-    Punto di ingresso principale dell'applicazione.
-    Gestisce il setup dell'ambiente, il logging e il ciclo di vita della GUI.
+    Main application entry point.
+    Handles environment setup, argument parsing, logging configuration, and GUI lifecycle.
     """
-    # 1. Setup del Logging
+    # 1. Setup command line arguments
+    parser = argparse.ArgumentParser(description="NI-XNET CAN Explorer & Telemetry")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging to console")
+    args = parser.parse_args()
+
+    # Determine logging level based on the command line flag
+    log_level = logging.DEBUG if args.debug else logging.INFO
+
+    # 2. Setup Logging
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=log_level,
         format='%(asctime)s - [%(levelname)s] - %(message)s'
     )
     
-    logging.info("Avvio del tool di Telemetria NI-XNET/IXXAT...")
+    # SILENCE EXTERNAL LIBRARIES
+    # Prevent matplotlib and PIL from flooding the terminal with internal debug messages
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
     
-    # 2. Setup dell'ambiente Matplotlib
+    logger = logging.getLogger(__name__)
+    logger.info("Starting NI-XNET/IXXAT Telemetry tool...")
+    
+    # 3. Setup Matplotlib environment
     setup_professional_environment()
     
     try:
-        # 3. Inizializzazione del motore grafico principale
+        # 4. Initialize main graphical engine
         root = tk.Tk()
         
-        # 4. Miglioramento dell'estetica dell'interfaccia OS-native
+        # 5. Enhance OS-native interface aesthetics
         style = ttk.Style()
-        # 'clam' o 'vista' o 'winnative' rendono i bottoni e i treeview molto più moderni
+        # 'clam', 'vista', or 'winnative' make buttons and treeviews look much more modern
         available_themes = style.theme_names()
         if 'clam' in available_themes:
             style.theme_use('clam')
             
-        # 5. Avvio dell'Applicazione
+        # 6. Launch the Application
         app = CanDbSelectorApp(root)
         
-        # 6. Avvio del Loop degli Eventi (blocca l'esecuzione finché non si chiude la finestra)
+        # 7. Start the Event Loop (blocks execution until the window is closed)
         root.mainloop()
         
     except Exception as e:
-        logging.critical(f"Errore fatale durante l'esecuzione: {e}", exc_info=True)
+        logger.critical(f"Fatal execution error: {e}", exc_info=True)
     finally:
-        # Si assicura che tutti i grafici aperti vengano chiusi quando si chiude il programma
+        # Ensure all open plots are closed when the program terminates
         plt.close('all')
-        logging.info("Applicazione terminata. Chiusura sicura dei processi.")
+        logger.info("Application terminated. Processes safely closed.")
 
 if __name__ == "__main__":
     main()

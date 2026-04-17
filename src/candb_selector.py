@@ -8,9 +8,12 @@ import matplotlib.pyplot as plt
 from src.can_log_parser import CanLogParser
 from src.can_decoder import CanDecoder
 
+# Initialize a module-specific logger
+logger = logging.getLogger(__name__)
+
 class CanDbSelectorApp:
     def __init__(self, root: tk.Tk) -> None:
-        logging.debug("Initializing Integrated CAN Explorer...")
+        logger.debug("Initializing Integrated CAN Explorer...")
         self.root = root
         self.root.title("NI-XNET CAN Explorer & Telemetry")
         self.root.geometry("700x600")
@@ -27,21 +30,21 @@ class CanDbSelectorApp:
         
         row_csv = tk.Frame(top_frame)
         row_csv.pack(side=tk.TOP, fill=tk.X, pady=2)
-        tk.Button(row_csv, text="1. Load IXXAT CSV (Dati)", command=self.load_csv, width=25, bg="lightblue").pack(side=tk.LEFT)
-        self.lbl_csv = tk.Label(row_csv, text="Nessun dato caricato", fg="gray")
+        tk.Button(row_csv, text="1. Load IXXAT CSV (Data)", command=self.load_csv, width=25, bg="lightblue").pack(side=tk.LEFT)
+        self.lbl_csv = tk.Label(row_csv, text="No data loaded", fg="gray")
         self.lbl_csv.pack(side=tk.LEFT, padx=10)
         
         row_xml = tk.Frame(top_frame)
         row_xml.pack(side=tk.TOP, fill=tk.X, pady=2)
         tk.Button(row_xml, text="2. Load NI-XNET XML (Database)", command=self.load_xml, width=25, bg="lightgreen").pack(side=tk.LEFT)
-        self.lbl_xml = tk.Label(row_xml, text="Nessun database selezionato", fg="gray")
+        self.lbl_xml = tk.Label(row_xml, text="No database selected", fg="gray")
         self.lbl_xml.pack(side=tk.LEFT, padx=10)
         
         mid_frame = tk.Frame(self.root)
         mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         self.tree = ttk.Treeview(mid_frame, selectmode="browse")
-        self.tree.heading("#0", text="CAN Architecture (Doppio click su Segnale per Plot)", anchor=tk.W)
+        self.tree.heading("#0", text="CAN Architecture (Double-click on Signal to Plot)", anchor=tk.W)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         scrollbar = ttk.Scrollbar(mid_frame, orient="vertical", command=self.tree.yview)
@@ -65,7 +68,7 @@ class CanDbSelectorApp:
             self.parse_xml(filepath)
 
     def parse_xml(self, filepath: str) -> None:
-        logging.info("Avvio parsing XML Relazionale FIBEX...")
+        logger.info("Starting Relational FIBEX XML parsing...")
         self.can_data.clear()
         
         try:
@@ -74,7 +77,7 @@ class CanDbSelectorApp:
             for elem in root.iter():
                 if '}' in elem.tag: elem.tag = elem.tag.split('}', 1)[1]
 
-            # 1. CODING (Matematica)
+            # 1. CODING (Math parameters)
             codings = {}
             for c in root.iter('CODING'):
                 c_id = c.get('ID')
@@ -88,7 +91,7 @@ class CanDbSelectorApp:
                     if len(v_elems) >= 2 and v_elems[1].text: f = float(v_elems[1].text)
                 codings[c_id] = {"bit_length": bl, "factor": f, "offset": o}
 
-            # 2. SEGNALI BASE
+            # 2. BASE SIGNALS
             signals = {}
             for sig in root.iter('SIGNAL'):
                 s_name = next((c.text.strip() for c in sig.iter('SHORT-NAME') if c.text), None)
@@ -105,7 +108,7 @@ class CanDbSelectorApp:
                 if bp is not None and sr is not None and bp.text:
                     start_bits[sr.get('ID-REF')] = int(bp.text.strip())
 
-            # 4. PDU ANALYSIS (Struttura Multiplexing)
+            # 4. PDU ANALYSIS (Multiplexing Structure)
             pdu_direct_signals = {}
             pdu_mux_roots = {}
             pdu_dynamic_links = {}
@@ -113,10 +116,10 @@ class CanDbSelectorApp:
             for pdu in root.iter('PDU'):
                 p_id = pdu.get('ID')
                 
-                # Segnali diretti
+                # Direct signals
                 pdu_direct_signals[p_id] = [sr.get('ID-REF') for sr in pdu.iter('SIGNAL-REF') if sr.get('ID-REF')]
                 
-                # Cerca Multiplexer Root
+                # Search for Multiplexer Root
                 switch = pdu.find('.//MULTIPLEXER/SWITCH')
                 if switch is not None:
                     m_name = switch.find('./SHORT-NAME').text.strip()
@@ -124,7 +127,7 @@ class CanDbSelectorApp:
                     m_bl = int(switch.find('./BIT-LENGTH').text)
                     pdu_mux_roots[p_id] = {"name": m_name, "start_bit": m_sb, "bit_length": m_bl}
 
-                # Cerca Dynamic Links
+                # Search for Dynamic Links
                 links = []
                 for spi in pdu.iter('SWITCHED-PDU-INSTANCE'):
                     code = spi.find('./SWITCH-CODE')
@@ -152,15 +155,15 @@ class CanDbSelectorApp:
                 for p_ref in frame.iter('PDU-REF'):
                     root_pdu_id = p_ref.get('ID-REF')
                     
-                    # 6.a Controlla se questa PDU comanda un Multiplexer
+                    # 6.a Check if this PDU controls a Multiplexer
                     frame_mux_info = pdu_mux_roots.get(root_pdu_id, None)
 
-                    # 6.b Aggiungi i segnali single (non multiplexati)
+                    # 6.b Add single signals (not multiplexed)
                     for s_ref in pdu_direct_signals.get(root_pdu_id, []):
                         if s_ref not in signals: continue
                         sig_name = signals[s_ref]["name"]
                         
-                        # SCARTA IL SEGNALE MULTIPLEXER DALLA GUI
+                        # DISCARD THE MULTIPLEXER SIGNAL FROM THE GUI
                         if frame_mux_info and sig_name == frame_mux_info["name"]:
                             continue
                             
@@ -175,7 +178,7 @@ class CanDbSelectorApp:
                             "mux_ctrl": None
                         }
 
-                    # 6.c Aggiungi i segnali Multiplexed dalle PDU dinamiche
+                    # 6.c Add Multiplexed signals from dynamic PDUs
                     for link in pdu_dynamic_links.get(root_pdu_id, []):
                         dyn_pdu_id = link["pdu_ref"]
                         switch_code = link["code"]
@@ -192,17 +195,17 @@ class CanDbSelectorApp:
                                 "factor": cod.get("factor", 1.0),
                                 "offset": cod.get("offset", 0.0),
                                 "mux_code": int(switch_code) if switch_code.isdigit() else switch_code,
-                                "mux_ctrl": frame_mux_info # Alleghiamo direttamente le info dell'offset!
+                                "mux_ctrl": frame_mux_info # Attach the offset info directly
                             }
 
                 self.can_data[f_name] = {'id': can_id, 'signals': frame_signals}
             
-            logging.info("XML Parser completato. GUI in aggiornamento.")
+            logger.info("XML Parser completed. Updating GUI.")
             self.populate_tree_base()
             
         except Exception as e:
-            logging.error(f"Errore XML: {e}", exc_info=True)
-            messagebox.showerror("Errore XML", str(e))
+            logger.error(f"XML Error: {e}", exc_info=True)
+            messagebox.showerror("XML Error", str(e))
 
     def populate_tree_base(self) -> None:
         for item in self.tree.get_children(): self.tree.delete(item)
@@ -221,7 +224,7 @@ class CanDbSelectorApp:
             
             signals = self.can_data.get(frame_name, {}).get('signals', {})
             for sig_name in sorted(signals.keys()):
-                # Niente più icone
+                # No more icons
                 self.tree.insert(node_id, tk.END, text=sig_name, values=("SIGNAL", sig_name, can_id, frame_name))
 
     def on_double_click(self, event: tk.Event) -> None:
@@ -232,8 +235,10 @@ class CanDbSelectorApp:
             self.plot_signal(vals[1], vals[2], vals[3])
 
     def plot_signal(self, sig_name: str, can_id: str, frame_name: str) -> None:
-        if not self.csv_loaded: return messagebox.showwarning("Dati", "Carica il CSV.")
-        if can_id not in self.log_parser.log_data: return messagebox.showinfo("Dati", f"ID {can_id} non nel CSV.")
+        if not self.csv_loaded: 
+            return messagebox.showwarning("Data", "Please load the CSV file first.")
+        if can_id not in self.log_parser.log_data: 
+            return messagebox.showinfo("Data", f"ID {can_id} not found in CSV.")
         
         sig_info = self.can_data[frame_name]['signals'][sig_name]
         role = sig_info['role']
@@ -247,24 +252,25 @@ class CanDbSelectorApp:
         for i, payload in enumerate(payloads):
             if not payload: continue
 
-            # 1. FILTRO MULTIPLEXING
+            # 1. MULTIPLEXING FILTER
             if role == 'multiplexed':
                 mux_ctrl = sig_info.get('mux_ctrl')
                 if not mux_ctrl: 
-                    continue # Se manca il controller, la riga è illeggibile, la scarto
+                    # If the controller is missing, the row is unreadable, discard it
+                    continue 
                 
-                # Estrae il valore dell'offset corrente dal payload
+                # Extract the current offset value from the payload
                 current_mux_val = CanDecoder.extract_raw_value(
                     payload, 
                     start_bit=mux_ctrl['start_bit'], 
                     bit_length=mux_ctrl['bit_length']
                 )
                 
-                # Se l'offset letto non coincide con il codice di sblocco della cella, salta il pacchetto!
+                # If the read offset does not match the cell's unlock code, skip the packet
                 if str(current_mux_val) != str(sig_info['mux_code']):
                     continue 
 
-            # 2. ESTRAZIONE VALORE
+            # 2. VALUE EXTRACTION
             raw_val = CanDecoder.extract_raw_value(
                 payload, 
                 start_bit=sig_info['start_bit'], 
@@ -278,7 +284,7 @@ class CanDbSelectorApp:
             plot_values.append(phys_val)
 
         if not plot_values:
-            messagebox.showinfo("Nessun dato", "Il segnale richiesto non è mai apparso in questo log CSV (Offset mai attivato).")
+            messagebox.showinfo("No Data", "The requested signal never appeared in this CSV log (Offset never triggered).")
             return
 
         plt.figure(figsize=(10, 5))
@@ -288,8 +294,8 @@ class CanDbSelectorApp:
         plt.title(f"{sig_name}  [{frame_name}]", fontsize=12)
         plt.suptitle(info_str, fontsize=9, color='gray', y=0.92)
         
-        plt.xlabel("Tempo (s)")
-        plt.ylabel("Valore")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Value")
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
         plt.show(block=False)
