@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 import os
 import logging
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 
 from src.can_log_parser import CanLogParser
 from src.can_decoder import CanDecoder
@@ -44,7 +45,7 @@ class CanDbSelectorApp:
         mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         self.tree = ttk.Treeview(mid_frame, selectmode="browse")
-        self.tree.heading("#0", text="CAN Architecture (Double-click on Signal to Plot)", anchor=tk.W)
+        self.tree.heading("#0", text="CAN Architecture (Double-click Frame for ALL, Signal for ONE)", anchor=tk.W)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         scrollbar = ttk.Scrollbar(mid_frame, orient="vertical", command=self.tree.yview)
@@ -77,19 +78,31 @@ class CanDbSelectorApp:
             for elem in root.iter():
                 if '}' in elem.tag: elem.tag = elem.tag.split('}', 1)[1]
 
-            # 1. CODING (Math parameters)
+            # 1. CODING (Math parameters & Signedness)
             codings = {}
             for c in root.iter('CODING'):
                 c_id = c.get('ID')
                 if not c_id: continue
                 bl = int(c.find('.//BIT-LENGTH').text) if c.find('.//BIT-LENGTH') is not None else 8
+                
+                is_signed = False
+                coded_type = c.find('.//CODED-TYPE')
+                if coded_type is not None:
+                    if coded_type.get('ENCODING', '').upper() == 'SIGNED':
+                        is_signed = True
+                    else:
+                        for attr_name, attr_value in coded_type.attrib.items():
+                            if 'BASE-DATA-TYPE' in attr_name.upper():
+                                if 'UINT' not in attr_value.upper() and 'INT' in attr_value.upper():
+                                    is_signed = True
+
                 f = 1.0; o = 0.0
                 num = c.find('.//COMPU-RATIONAL-COEFFS/COMPU-NUMERATOR')
                 if num is not None:
                     v_elems = list(num.iter('V'))
                     if len(v_elems) >= 1 and v_elems[0].text: o = float(v_elems[0].text)
                     if len(v_elems) >= 2 and v_elems[1].text: f = float(v_elems[1].text)
-                codings[c_id] = {"bit_length": bl, "factor": f, "offset": o}
+                codings[c_id] = {"bit_length": bl, "factor": f, "offset": o, "is_signed": is_signed}
 
             # 2. BASE SIGNALS
             signals = {}
@@ -115,11 +128,8 @@ class CanDbSelectorApp:
 
             for pdu in root.iter('PDU'):
                 p_id = pdu.get('ID')
-                
-                # Direct signals
                 pdu_direct_signals[p_id] = [sr.get('ID-REF') for sr in pdu.iter('SIGNAL-REF') if sr.get('ID-REF')]
                 
-                # Search for Multiplexer Root
                 switch = pdu.find('.//MULTIPLEXER/SWITCH')
                 if switch is not None:
                     m_name = switch.find('./SHORT-NAME').text.strip()
@@ -127,7 +137,6 @@ class CanDbSelectorApp:
                     m_bl = int(switch.find('./BIT-LENGTH').text)
                     pdu_mux_roots[p_id] = {"name": m_name, "start_bit": m_sb, "bit_length": m_bl}
 
-                # Search for Dynamic Links
                 links = []
                 for spi in pdu.iter('SWITCHED-PDU-INSTANCE'):
                     code = spi.find('./SWITCH-CODE')
@@ -154,18 +163,12 @@ class CanDbSelectorApp:
 
                 for p_ref in frame.iter('PDU-REF'):
                     root_pdu_id = p_ref.get('ID-REF')
-                    
-                    # 6.a Check if this PDU controls a Multiplexer
                     frame_mux_info = pdu_mux_roots.get(root_pdu_id, None)
 
-                    # 6.b Add single signals (not multiplexed)
                     for s_ref in pdu_direct_signals.get(root_pdu_id, []):
                         if s_ref not in signals: continue
                         sig_name = signals[s_ref]["name"]
-                        
-                        # DISCARD THE MULTIPLEXER SIGNAL FROM THE GUI
-                        if frame_mux_info and sig_name == frame_mux_info["name"]:
-                            continue
+                        if frame_mux_info and sig_name == frame_mux_info["name"]: continue
                             
                         cod = codings.get(signals[s_ref]["coding_id"], {})
                         frame_signals[sig_name] = {
@@ -174,11 +177,11 @@ class CanDbSelectorApp:
                             "bit_length": cod.get("bit_length", 8),
                             "factor": cod.get("factor", 1.0),
                             "offset": cod.get("offset", 0.0),
+                            "is_signed": cod.get("is_signed", False),
                             "mux_code": None,
                             "mux_ctrl": None
                         }
 
-                    # 6.c Add Multiplexed signals from dynamic PDUs
                     for link in pdu_dynamic_links.get(root_pdu_id, []):
                         dyn_pdu_id = link["pdu_ref"]
                         switch_code = link["code"]
@@ -194,8 +197,9 @@ class CanDbSelectorApp:
                                 "bit_length": cod.get("bit_length", 8),
                                 "factor": cod.get("factor", 1.0),
                                 "offset": cod.get("offset", 0.0),
+                                "is_signed": cod.get("is_signed", False),
                                 "mux_code": int(switch_code) if switch_code.isdigit() else switch_code,
-                                "mux_ctrl": frame_mux_info # Attach the offset info directly
+                                "mux_ctrl": frame_mux_info 
                             }
 
                 self.can_data[f_name] = {'id': can_id, 'signals': frame_signals}
@@ -224,21 +228,22 @@ class CanDbSelectorApp:
             
             signals = self.can_data.get(frame_name, {}).get('signals', {})
             for sig_name in sorted(signals.keys()):
-                # No more icons
                 self.tree.insert(node_id, tk.END, text=sig_name, values=("SIGNAL", sig_name, can_id, frame_name))
 
     def on_double_click(self, event: tk.Event) -> None:
         node_id = self.tree.focus()
         if not node_id: return
         vals = self.tree.item(node_id, "values")
+        
+        # Branch based on whether a Signal or a Frame was clicked
         if len(vals) == 4 and vals[0] == "SIGNAL":
             self.plot_signal(vals[1], vals[2], vals[3])
+        elif len(vals) == 2:
+            self.plot_all_frame_signals(vals[0], vals[1])
 
     def plot_signal(self, sig_name: str, can_id: str, frame_name: str) -> None:
-        if not self.csv_loaded: 
-            return messagebox.showwarning("Data", "Please load the CSV file first.")
-        if can_id not in self.log_parser.log_data: 
-            return messagebox.showinfo("Data", f"ID {can_id} not found in CSV.")
+        if not self.csv_loaded: return messagebox.showwarning("Data", "Please load the CSV file first.")
+        if can_id not in self.log_parser.log_data: return messagebox.showinfo("Data", f"ID {can_id} not found in CSV.")
         
         sig_info = self.can_data[frame_name]['signals'][sig_name]
         role = sig_info['role']
@@ -252,50 +257,60 @@ class CanDbSelectorApp:
         for i, payload in enumerate(payloads):
             if not payload: continue
 
-            # 1. MULTIPLEXING FILTER
             if role == 'multiplexed':
                 mux_ctrl = sig_info.get('mux_ctrl')
-                if not mux_ctrl: 
-                    # If the controller is missing, the row is unreadable, discard it
-                    continue 
-                
-                # Extract the current offset value from the payload
-                current_mux_val = CanDecoder.extract_raw_value(
-                    payload, 
-                    start_bit=mux_ctrl['start_bit'], 
-                    bit_length=mux_ctrl['bit_length']
-                )
-                
-                # If the read offset does not match the cell's unlock code, skip the packet
-                if str(current_mux_val) != str(sig_info['mux_code']):
-                    continue 
+                if not mux_ctrl: continue 
+                current_mux_val = CanDecoder.extract_raw_value(payload, start_bit=mux_ctrl['start_bit'], bit_length=mux_ctrl['bit_length'])
+                if str(current_mux_val) != str(sig_info['mux_code']): continue 
 
-            # 2. VALUE EXTRACTION
-            raw_val = CanDecoder.extract_raw_value(
-                payload, 
-                start_bit=sig_info['start_bit'], 
-                bit_length=sig_info['bit_length']
-            )
-            
-            # 3. SCALING
+            raw_val = CanDecoder.extract_raw_value(payload, start_bit=sig_info['start_bit'], bit_length=sig_info['bit_length'])
             phys_val = CanDecoder.apply_scaling(raw_val, factor=sig_info['factor'], offset=sig_info['offset'])
 
             plot_times.append(times[i])
             plot_values.append(phys_val)
 
         if not plot_values:
-            messagebox.showinfo("No Data", "The requested signal never appeared in this CSV log (Offset never triggered).")
+            messagebox.showinfo("No Data", "The requested signal never appeared in this CSV log.")
             return
 
-        plt.figure(figsize=(10, 5))
-        plt.plot(plot_times, plot_values, label=f"{sig_name}", color='#2c3e50', linewidth=1.5)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.set_layout_engine(None)
         
-        info_str = f"Bit:{sig_info['start_bit']} | Len:{sig_info['bit_length']} | MuxCode:{sig_info.get('mux_code', 'N/A')} | Factor:{sig_info['factor']}"
-        plt.title(f"{sig_name}  [{frame_name}]", fontsize=12)
-        plt.suptitle(info_str, fontsize=9, color='gray', y=0.92)
+        # Lowered the top margin to 82% to make room for the button at the top
+        fig.subplots_adjust(top=0.82, bottom=0.15, left=0.08, right=0.95)
         
-        plt.xlabel("Time (s)")
-        plt.ylabel("Value")
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.tight_layout()
+        line, = ax.plot(plot_times, plot_values, label=f"{sig_name}", color='#2c3e50', linewidth=1.5)
+        
+        is_signed = 'S' if sig_info.get('is_signed') else 'U'
+        info_str = f"Bit: {sig_info['start_bit']}  |  Len: {sig_info['bit_length']}  |  S/U: {is_signed}  |  Mux: {sig_info.get('mux_code', 'N/A')}  |  Factor: {sig_info['factor']}"
+        ax.set_title(f"{sig_name}  [{frame_name}]\n{info_str}", fontsize=12, pad=10)
+        
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Value")
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.legend(loc="upper right")
+        
+        # --- WIDGET CONFIGURATION ---
+        # Positioned in the TOP RIGHT corner: [left, bottom, width, height]
+        ax_button = fig.add_axes([0.83, 0.92, 0.15, 0.05]) 
+        ax_button.set_in_layout(False)
+        
+        fig.btn_marker = Button(ax_button, 'Enable Markers')
+        fig.markers_active = False 
+        
+        def toggle_markers(event):
+            fig.markers_active = not fig.markers_active
+            if fig.markers_active:
+                line.set_marker('.')
+                line.set_label(f"{sig_name} [{len(plot_values)} samples]")
+                fig.btn_marker.label.set_text('Disable Markers')
+            else:
+                line.set_marker('None')
+                line.set_label(f"{sig_name}")
+                fig.btn_marker.label.set_text('Enable Markers')
+                
+            ax.legend(loc="upper right")
+            fig.canvas.draw_idle()
+
+        fig.btn_marker.on_clicked(toggle_markers)
         plt.show(block=False)
